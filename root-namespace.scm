@@ -1,7 +1,9 @@
 (declare (usual-integrations))
 
 ;; Root (parent) to all namespaces
-(define root-namespace (make-top-level-environment))
+;; (define root-namespace (make-top-level-environment))
+;; for scmutils: different parent environment
+(define root-namespace (extend-top-level-environment generic-environment))
 
 ;; Keep the list of all namespaces
 ;; Have a reference to itself

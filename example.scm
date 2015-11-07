@@ -7,5 +7,8 @@
       1
       (* n (factorial (sub1 n)))))
 
-
+(define-syntax when
+  (syntax-rules ()
+    ((when ?text ?expr ...)
+     (if ?text (begin ?expr ...)))))
 
