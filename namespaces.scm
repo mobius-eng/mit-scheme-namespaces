@@ -1,76 +1,115 @@
 (declare (usual-integrations))
 
-(define *ns-name* 'scheme)
-
-;; Helper function: avoid environment-lookup throwing an error
-(define (find-in-environment env name default)
-  (let ((ns-bindings (environment-bound-names env)))
-    (if (memq name ns-bindings)
-	(environment-lookup env name)
-	default)))
-
 ;; this one is useless for 'scheme namespace
 ;; but let's keep it for consistency
+(define *name* '(scheme))
+
 (define *provided-names*
   (environment-bound-names generic-environment))
 
 (define *provided-macros* (environment-macro-names generic-environment))
 
-(define (provided-names #!optional ns)
+(define (find-namespace-structure ns)
+  (let loop ((n ns)
+	     (table *namespaces*))
+    (cond ((not (pair? n)) (values #f #f (list 'bad-namespace ns)))
+	  ((null? (cdr n))
+	   (let ((entry (hash-table/get table (car n) #f)))
+	     (if entry
+		 (values entry #t #f)
+		 (values #f #f (list 'not-found ns n)))))
+	  (else (let ((entry (hash-table/get table (car n) #f)))
+		  (if entry
+		      (loop (cdr n) (cdr entry))
+		      (values #f #f (list 'not-found ns n))))))))
+
+(define (get-namespace-entry ns)
+  (receive (entry found? error-msg) (find-namespace-structure ns)
+    (if found?
+	entry
+	(error 'get-namespace-entry "Error" error-msg))))
+
+(define (namespace->environment ns)
+  (receive (entry found? error-msg) (find-namespace-structure ns)
+    (if found?
+	(car entry)
+	(case (car error-msg)
+	  ((bad-namespace) (error 'namespace->envrionment
+				  "Bad namespace"
+				  (cdr error-msg)))
+	  ((not-found) (error 'namespace->environment
+			      "Cannot find namespace"
+			      (cdr error-msg)))
+	  (else (error 'namespace->environment
+		       "Error"
+		       error-msg))))))
+
+(define (find-namespace-environment ns)
+  (receive (entry found? error-msg) (find-namespace-structure ns)
+    (and found? (car entry))))
+
+(define ns->env namespace->environment)
+
+
+(define (namespace? ns)
+  (and (pair? ns)
+       (find-namespace-environment ns)))
+
+(define ns? namespace?)
+
+(define (ns/provided-names #!optional ns)
   (let ((env (if (default-object? ns)
 		 (nearest-repl/environment)
 		 (namespace->environment ns))))
     (environment-lookup env '*provided-names*)))
 
-(define (provided-macros #!optional ns)
+(define (ns/provided-macros #!optional ns)
   (let ((env (if (default-object? ns)
 		 (nearest-repl/environment)
 		 (namespace->environment ns))))
     (environment-lookup env '*provided-macros*)))
 
-(define (add-namespace! ns)
-  (let ((ns-name (find-in-environment ns '*ns-name* #f)))
-    (if ns-name
-	(hash-table/put! *namespaces* ns-name ns)
-	(error 'add-namespace! "Object is not a namespace" ns))))
-
-(define (remove-namespace! ns-name)
-  (if (eq? ns-name 'scheme)
-      (error 'remove-namespace!
-	     "Cannot remove root namespace")
-      (hash-table/remove! *namespaces* ns-name)))
-
 (define (change-namespace! ns-name)
-  (let ((ns (or (hash-table/get *namespaces*
-				ns-name
-				#f)
-		(error 'change-namespace!
-		       "Cannot find namespace"
-		       ns-name))))
-    (ge ns)))
+  (ge (ns->env ns-name)))
 
-(define (list-namespaces)
-  (hash-table/key-list *namespaces*))
+(define (namespace-define ns . symbol-values)
+  (let ((env (namespace->environment ns)))
+    (let loop ((symbol-values symbol-values))
+      (cond ((null? symbol-values) 'done)
+	    ((null? (cdr symbol-values))
+	     (error 'namespace-define
+		    "No value provided for symbol"
+		    (car symbol-values)))
+	    (else
+	     (environment-define env
+				 (car symbol-values)
+				 (cadr symbol-values))
+	     (loop (cddr symbol-values)))))))
 
+(define (make-namespace parent ext-name)
+  (let ((parent-entry (if (null? parent)
+			  (cons '() *namespaces*)
+			  (get-namespace-entry parent))))
+    (let ((table (cdr parent-entry))
+	  (name (append parent (list ext-name)))
+	  (env (extend-top-level-environment
+		(namespace->environment '(scheme)))))
+      (hash-table/put! table
+		       ext-name
+		       (cons env
+			     (make-strong-eq-hash-table)))
+      (namespace-define name
+			'*ns-name* name
+			'*provided-names* '()
+			'*provided-macros* '())
+      (append parent (list ext-name)))))
 
-(define (namespace->environment ns-name)
-  (or (hash-table/get *namespaces* ns-name #f)
-      (error 'namespace->environment
-	     "Cannot find namespace"
-	     ns-nname)))
-
-(define (make-namespace name)
-  (let ((ns (extend-top-level-environment
-	     (namespace->environment 'scheme))))
-    (environment-define ns '*ns-name* name)
-    (environment-define ns '*provided-names* '())
-    (environment-define ns '*provided-macros* '())
-    ns))
-
-(define (import-names! target-ns ns-name included-names)
-  (let* ((target-env (namespace->environment target-ns))
-	 (imported-env (namespace->environment ns-name))
-	 (provided-names (provided-names ns-name)))
+(define (ns/import-names!  from-ns included-names #!optional target-ns)
+  (let ((target-env (if (default-object? target-ns)
+			(nearest-repl/environment)
+			(namespace->environment target-ns)))
+	(imported-env (namespace->environment from-ns))
+	(provided-names (ns/provided-names from-ns)))
     (for-each
      (lambda (name)
        (let ((original-name (if (pair? name) (car name) name))
@@ -80,16 +119,18 @@
 			     subst-name
 			     imported-env
 			     original-name)
-	     (error 'load-namespace!
+	     (error 'ns/import-names!
 		    "Cannot find name in ns"
 		    name
-		    ns-name))))
+		    from-ns))))
      included-names)))
 
-(define (import-macros! target-ns source-ns macros)
-  (let* ((target-env (namespace->environment target-ns))
-	 (source-env (namespace->environment source-ns))
-	 (source-macros (provided-macros source-ns)))
+(define (ns/import-macros! source-ns macros #!optional target-ns)
+  (let ((target-env (if (default-object? target-ns)
+			(nearest-repl/environment)
+			(namespace->environment target-ns)))
+	(source-env (namespace->environment source-ns))
+	(source-macros (ns/provided-macros source-ns)))
     (for-each
      (lambda (macro)
        (let ((original-macro (if (pair? macro) (car macro) macro))
@@ -99,44 +140,41 @@
 	      target-env
 	      new-macro
 	      (environment-lookup-macro source-env original-macro))
-	     (error 'import-macros!
+	     (error 'ns/import-macros!
 		    "Cannot find macro in namespace"
 		    original-macro
 		    source-ns))))
      macros)))
 
-
 (define (get-current-ns-name)
-  (environment-lookup (nearest-repl/environment) '*ns-name*))
+  (environment-lookup-or (nearest-repl/environment) '*ns-name* #f))
 
-
-(define (import-names-with-prefix! target-ns ns-name prefix)
+(define (ns/import-names-with-prefix! ns-name names prefix #!optional target-ns)
+  (define prefix-string (symbol->string prefix))
   (define (prefix-symbol s)
-    (string->symbol (string-append prefix (symbol->string s))))
-  (let* ((names (provided-names ns-name))
-	 (prefixed-names (map (lambda (name)
-				(cons name (prefix-symbol name)))
-			      names)))
-    (import-names! target-ns ns-name prefixed-names)))
+    (string->symbol (string-append prefix-string (symbol->string s))))
+  (let ((prefixed-names (map (lambda (name)
+			       (cons name (prefix-symbol name)))
+			     names)))
+    (ns/import-names! ns-name prefixed-names target-ns)))
 
-(define (provide-names! ns-name . names)
+(define (ns/add-to-provided-names! ns-name . names)
   (let ((env (namespace->environment ns-name)))
     (environment-assign!
      env
      '*provided-names*
      (append names (environment-lookup env '*provided-names*)))))
 
-
-(define (import-macros-with-prefix! target-ns source-ns prefix)
+(define (ns/import-macros-with-prefix! source-ns macros prefix #!optional target-ns)
+  (define prefix-string (symbol->string prefix))
   (define (prefix-symbol s)
-    (string->symbol (string-append prefix (symbol->string s))))
-  (let* ((macros (provided-macros source-ns))
-	 (prefixed-macros (map (lambda (macro)
-				 (cons macro (prefix-symbol macro)))
-			       macros)))
-    (import-macros! target-ns source-ns prefixed-macros)))
+    (string->symbol (string-append prefix-string (symbol->string s))))
+  (let ((prefixed-macros (map (lambda (macro)
+				(cons macro (prefix-symbol macro)))
+			      macros)))
+    (ns/import-macros! source-ns prefixed-macros target-ns)))
 
-(define (provide-macros! ns-name . macros)
+(define (ns/add-to-provided-macros! ns-name . macros)
   (let ((env (namespace->environment ns-name)))
     (environment-assign!
      env
@@ -146,43 +184,60 @@
 (define-syntax import-opt
   (syntax-rules (prefix only)
     ((import-opt ?target-ns  (?ns-name (prefix ?prefix)))
-     (import-names-with-prefix! '?target-ns
-				'?ns-name
-				(symbol->string '?prefix)))
+     (ns/import-names-with-prefix! '?ns-name
+				   (ns/provided-names '?ns-name)
+				   '?prefix
+				   '?target-ns))
     ((import-opt ?target-ns (?ns-name (only ?name ...)))
-     (import-names! '?target-ns '?ns-name '(?name ...)))))
+     (ns/import-names! '?ns-name '(?name ...) '?target-ns))))
 
 (define-syntax import-macros-opt
   (syntax-rules (prefix only)
     ((import-macros-opt ?target-ns (?source-ns (prefix ?prefix)))
-     (import-macros-with-prefix! '?target-ns
-				 '?source-ns
-				 (symbol->string '?prefix)))
+     (ns/import-macros-with-prefix! '?source-ns
+				    (ns/provided-macros '?source-ns)
+				    '?prefix
+				    '?target-ns))
     ((import-macros-opt ?target-ns (?source-ns (only ?macro ...)))
-     (import-macros! '?target-ns '?source-ns '(?macro ...)))))
+     (ns/import-macros! '?source-ns '(?macro ...) '?target-ns))))
 
 (define-syntax ns-opt
   (syntax-rules (file provide import provide-syntax import-syntax)
     ((ns-opt ?name (file ?file-name))
-     (load ?file-name (namespace->environment '?name)))
+     (begin (compile-file ?file-name '() (namespace->environment '?name))
+	    (load ?file-name (namespace->environment '?name))))
     ((ns-opt ?name (provide ?proc ...))
-     (provide-names! '?name '?proc ...))
+     (ns/add-to-provided-names! '?name '?proc ...))
     ((ns-opt ?name (import ?ns-opts))
      (import-opt ?name ?ns-opts))
     ((ns-opt ?name (provide-syntax ?macro ...))
-     (provide-macros! '?name '?macro ...))
+     (ns/add-to-provided-macros! '?name '?macro ...))
     ((ns-opt ?name (import-syntax ?macro-opts))
      (import-macros-opt ?name ?macro-opts))))
 
 (define-syntax ns
   (syntax-rules ()
     ((ns ?name ?opt1 ...)
-     (begin
-       (add-namespace! (make-namespace (quote ?name)))
+     (let ((nm '?name))
+       (make-namespace (butlast nm) (last nm))
        (ns-opt ?name ?opt1)
        ...))))
 
-
+(define (list-namespaces)
+  (define (list-ns-loop table prefix)
+    (let* ((modules (hash-table/key-list table))
+	   (cur-level-ns (map (lambda (m) (append prefix (list m)))
+			      modules)))
+      (if (null? modules)
+	  '()
+	  (append cur-level-ns
+		  (mapcan (lambda (m ns-name)
+			    (list-ns-loop (cdr (hash-table/get table m #f))
+					  ns-name))
+			  modules
+			  cur-level-ns)))))
+  
+  (list-ns-loop *namespaces* '()))
 
 
 

@@ -12,3 +12,5 @@
     ((when ?text ?expr ...)
      (if ?text (begin ?expr ...)))))
 
+
+;;; package: (example)
